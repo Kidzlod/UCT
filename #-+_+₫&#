@@ -29,19 +29,6 @@ if not enforceStaffAccess() then
 	return
 end
 
-local integrityStage = 0
-local function advanceIntegrity(expectedStage, nextStage)
-	if integrityStage ~= expectedStage then
-		return false
-	end
-	integrityStage = nextStage
-	return true
-end
-
-if not advanceIntegrity(0, 1) then
-	return
-end
-
 local shared = (getgenv and getgenv()) or _G
 if shared.FrixRewriteCleanup then
 	pcall(shared.FrixRewriteCleanup)
@@ -52,12 +39,14 @@ if game.CoreGui:FindFirstChild("FRIX_REWRITE") then
 	game.CoreGui.FRIX_REWRITE:Destroy()
 end
 
+local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
+local LocalPlayer = Players.LocalPlayer
 
 task.spawn(function()
 	pcall(function()
@@ -94,8 +83,16 @@ local state = {
 	instantKill = false,
 	instantKillNoHit = false,
 	autoFarm = false,
-	playableName = "Prototype B 1.0",
-	techLevel = 1,
+	autoSpawnPartner = false,
+	autoPurchaseUpgrade = false,
+	playableName = "Giant 67",
+	selectedSkills = {},
+	levelStrength = 1,
+	levelTech = 1,
+	levelMorale = 1,
+	hoverHeight = 150,
+	partnerRace = "Camcorder",
+	partnerName = "Camcorder",
 	modeName = "Easy",
 	attackIndex = 2,
 }
@@ -105,9 +102,16 @@ local CONFIG_FILE = CONFIG_FOLDER .. "/config.json"
 local CONFIG_KEYS = {
 	playableName = "string",
 	modeName = "string",
-	techLevel = "number",
+	levelStrength = "number",
+	levelTech = "number",
+	levelMorale = "number",
 	attackIndex = "number",
+	hoverHeight = "number",
+	partnerRace = "string",
+	partnerName = "string",
+	selectedSkills = "table",
 }
+local LEVEL_KEYS = { "levelStrength", "levelTech", "levelMorale" }
 
 local function canUseFiles()
 	return type(isfile) == "function" and type(readfile) == "function" and type(writefile) == "function"
@@ -124,13 +128,23 @@ local function loadConfig()
 				state[key] = data[key]
 			end
 		end
+		if type(data.techLevel) == "number" then
+			for _, key in ipairs(LEVEL_KEYS) do
+				if type(data[key]) ~= "number" then
+					state[key] = data.techLevel
+				end
+			end
+		end
 	end)
 
 	state.playableName = string.match(state.playableName, "^%s*(.-)%s*$")
 	if state.playableName == "" then state.playableName = "Giant Screen" end
 	state.modeName = string.match(state.modeName, "^%s*(.-)%s*$")
 	if state.modeName == "" then state.modeName = "Easy" end
-	state.techLevel = math.max(1, math.floor(state.techLevel))
+	for _, key in ipairs(LEVEL_KEYS) do
+		state[key] = math.max(1, math.floor(state[key]))
+	end
+	state.hoverHeight = math.max(0, state.hoverHeight)
 	state.attackIndex = math.clamp(math.floor(state.attackIndex), 1, 3)
 end
 
@@ -157,8 +171,15 @@ local function connect(connection)
 end
 
 local function disconnect(connection)
-	if connection and connection.Connected then
+	if not connection then return end
+	if connection.Connected then
 		connection:Disconnect()
+	end
+	for index = #connections, 1, -1 do
+		if connections[index] == connection then
+			table.remove(connections, index)
+			break
+		end
 	end
 end
 
@@ -210,78 +231,119 @@ end
 
 local espConnection
 local espHealthConnections = {}
-local espRetrying = {}
+local espModelHumanoids = {}
+local espAdorneeRefresh = {}
+local espToken = 0
 local applyNpcHighlight
 
-local function retryNpcEsp(model)
-	if espRetrying[model] then return end
-	espRetrying[model] = true
+local function cleanupHumanoidEspConnection(humanoid)
+	local tracked = espHealthConnections[humanoid]
+	if not tracked then return end
+	disconnect(tracked.health)
+	disconnect(tracked.ancestry)
+	if espModelHumanoids[tracked.model] == humanoid then
+		espModelHumanoids[tracked.model] = nil
+	end
+	espHealthConnections[humanoid] = nil
+end
 
-	task.spawn(function()
-		for _ = 1, 20 do
-			if not state.npcEsp or not model.Parent then break end
-			task.wait(0.5)
-			applyNpcHighlight(model)
-			if model:FindFirstChild("FriXRewriteHealth") then break end
+local function removeNpcEsp(model)
+	local highlight = model:FindFirstChild("FriXRewriteHighlight")
+	if highlight then highlight:Destroy() end
+	local billboard = model:FindFirstChild("FriXRewriteHealth")
+	if billboard then billboard:Destroy() end
+	espAdorneeRefresh[model] = nil
+	local humanoid = espModelHumanoids[model]
+	if not humanoid then
+		humanoid = model:FindFirstChildWhichIsA("Humanoid", true)
+	end
+	if humanoid then
+		cleanupHumanoidEspConnection(humanoid)
+	end
+end
+
+local function getEspAdornee(model, humanoid)
+	local head = model:FindFirstChild("Head", true)
+	if head and head:IsA("BasePart") then
+		return head
+	end
+
+	local highestPart
+	for _, descendant in ipairs(model:GetDescendants()) do
+		if descendant:IsA("BasePart") and (not highestPart or descendant.Position.Y > highestPart.Position.Y) then
+			highestPart = descendant
 		end
-		espRetrying[model] = nil
-	end)
+	end
+	return highestPart or humanoid.RootPart
+end
+
+local function updateEspText(model, humanoid)
+	local billboard = model:FindFirstChild("FriXRewriteHealth")
+	local label = billboard and billboard:FindFirstChild("HealthLabel")
+	if label then
+		label.Text = string.format("HP: %d / %d", math.max(0, math.floor(humanoid.Health + 0.5)), math.floor(humanoid.MaxHealth + 0.5))
+	end
 end
 
 applyNpcHighlight = function(model)
 	if not model:IsA("Model") then return end
 
 	if isAllyName(model.Name) then
-		local oldHighlight = model:FindFirstChild("FriXRewriteHighlight")
-		if oldHighlight then oldHighlight:Destroy() end
-		local oldHealth = model:FindFirstChild("FriXRewriteHealth")
-		if oldHealth then oldHealth:Destroy() end
+		removeNpcEsp(model)
 		return
 	end
 
-	local humanoid = model:FindFirstChildWhichIsA("Humanoid", true)
+	local humanoid = espModelHumanoids[model]
+	if humanoid and not humanoid:IsDescendantOf(model) then
+		cleanupHumanoidEspConnection(humanoid)
+		humanoid = nil
+	end
 	if not humanoid then
-		retryNpcEsp(model)
+		humanoid = model:FindFirstChildWhichIsA("Humanoid", true)
+		if humanoid then
+			espModelHumanoids[model] = humanoid
+		end
+	end
+	if not humanoid then return end
+
+	if humanoid.Health <= 0 then
+		removeNpcEsp(model)
 		return
-end
+	end
+
+	local billboard = model:FindFirstChild("FriXRewriteHealth")
+	local adornee = billboard and billboard.Adornee
+	local now = os.clock()
+	if not adornee or not adornee:IsDescendantOf(model) or now - (espAdorneeRefresh[model] or 0) >= 1.5 then
+		adornee = getEspAdornee(model, humanoid)
+		espAdorneeRefresh[model] = now
+	end
+	if not adornee then return end
 
 	local highlight = model:FindFirstChild("FriXRewriteHighlight")
 	if not highlight then
 		highlight = Instance.new("Highlight")
 		highlight.Name = "FriXRewriteHighlight"
+		highlight.Adornee = model
+		highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		highlight.FillColor = Color3.fromRGB(255, 235, 70)
+		highlight.FillTransparency = 0.35
+		highlight.OutlineColor = Color3.fromRGB(255, 170, 20)
+		highlight.OutlineTransparency = 0
 		highlight.Parent = model
 	end
 
-	highlight.Adornee = model
-	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-	highlight.FillColor = Color3.fromRGB(255, 235, 70)
-	highlight.FillTransparency = 0.35
-	highlight.OutlineColor = Color3.fromRGB(255, 170, 20)
-	highlight.OutlineTransparency = 0
-
-	local adornee = model:FindFirstChild("Head")
-		or model:FindFirstChild("HumanoidRootPart")
-		or model:FindFirstChildWhichIsA("BasePart", true)
-	if not adornee then
-		retryNpcEsp(model)
-		return
-	end
-
-	local billboard = model:FindFirstChild("FriXRewriteHealth")
 	if not billboard then
 		billboard = Instance.new("BillboardGui")
 		billboard.Name = "FriXRewriteHealth"
 		billboard.Size = UDim2.fromOffset(130, 28)
-		billboard.StudsOffset = Vector3.new(0, 3.5, 0)
+		billboard.StudsOffset = Vector3.new(0, 1.5, 0)
 		billboard.AlwaysOnTop = true
 		billboard.MaxDistance = 10000
+		billboard.Adornee = adornee
 		billboard.Parent = model
-	end
-	billboard.Adornee = adornee
 
-	local healthLabel = billboard:FindFirstChild("HealthLabel")
-	if not healthLabel then
-		healthLabel = Instance.new("TextLabel")
+		local healthLabel = Instance.new("TextLabel")
 		healthLabel.Name = "HealthLabel"
 		healthLabel.Size = UDim2.fromScale(1, 1)
 		healthLabel.BackgroundTransparency = 1
@@ -291,53 +353,81 @@ end
 		healthLabel.TextStrokeTransparency = 0
 		healthLabel.TextSize = 16
 		healthLabel.Parent = billboard
+	elseif billboard.Adornee ~= adornee then
+		billboard.Adornee = adornee
 	end
 
-	local function updateHealthText(health)
-		healthLabel.Text = string.format("HP: %d / %d", math.max(0, math.floor(health + 0.5)), math.floor(humanoid.MaxHealth + 0.5))
-	end
-
-	updateHealthText(humanoid.Health)
+	updateEspText(model, humanoid)
 	if not espHealthConnections[humanoid] then
-		espHealthConnections[humanoid] = humanoid.HealthChanged:Connect(updateHealthText)
+		local tracked = { model = model }
+		espHealthConnections[humanoid] = tracked
+		tracked.health = humanoid.HealthChanged:Connect(function(health)
+			if health <= 0 then
+				removeNpcEsp(model)
+			elseif model:FindFirstChild("FriXRewriteHealth") then
+				updateEspText(model, humanoid)
+			elseif state.npcEsp then
+				applyNpcHighlight(model)
+			end
+		end)
+		tracked.ancestry = model.AncestryChanged:Connect(function(_, parent)
+			if parent == nil then
+				removeNpcEsp(model)
+			end
+		end)
 	end
-	espRetrying[model] = nil
 end
 
 local function stopNpcEsp()
 	state.npcEsp = false
+	espToken += 1
 	disconnect(espConnection)
 	espConnection = nil
-	for humanoid, connection in pairs(espHealthConnections) do
-		disconnect(connection)
-		espHealthConnections[humanoid] = nil
+	for humanoid in pairs(espHealthConnections) do
+		cleanupHumanoidEspConnection(humanoid)
 	end
 
 	local ai = Workspace:FindFirstChild("AI")
 	if ai then
 		for _, model in ipairs(ai:GetChildren()) do
-			local highlight = model:FindFirstChild("FriXRewriteHighlight")
-			if highlight then highlight:Destroy() end
-			local healthDisplay = model:FindFirstChild("FriXRewriteHealth")
-			if healthDisplay then healthDisplay:Destroy() end
+			removeNpcEsp(model)
 		end
 	end
 end
 
 local function startNpcEsp()
-	if espConnection then return end
+	if state.npcEsp then return end
 	state.npcEsp = true
+	espToken += 1
+	local token = espToken
 
 	local ai = Workspace:FindFirstChild("AI")
-	if not ai then return end
-
-	for _, model in ipairs(ai:GetChildren()) do
-		applyNpcHighlight(model)
+	if ai then
+		for _, model in ipairs(ai:GetChildren()) do
+			applyNpcHighlight(model)
+		end
+		espConnection = connect(ai.ChildAdded:Connect(function(model)
+			if state.npcEsp then applyNpcHighlight(model) end
+		end))
 	end
 
-	espConnection = connect(ai.ChildAdded:Connect(function(model)
-		if state.npcEsp then applyNpcHighlight(model) end
-	end))
+	task.spawn(function()
+		while state.npcEsp and espToken == token do
+			local currentAi = Workspace:FindFirstChild("AI")
+			if currentAi then
+				for _, model in ipairs(currentAi:GetChildren()) do
+					if not state.npcEsp or espToken ~= token then break end
+					applyNpcHighlight(model)
+				end
+			end
+			for humanoid in pairs(espHealthConnections) do
+				if not currentAi or not humanoid:IsDescendantOf(currentAi) then
+					cleanupHumanoidEspConnection(humanoid)
+				end
+			end
+			task.wait(0.5)
+		end
+	end)
 end
 
 local killHealthConnections = {}
@@ -345,31 +435,47 @@ local killHealthSnapshot = {}
 local npcHumanoids = {}
 local npcCacheConnection
 local noHitLoopActive = false
+local instantKillPruneToken = 0
 local stopInstantKill
 local stopInstantKillNoHit
+
+local function releaseNpcHumanoid(humanoid)
+	disconnect(killHealthConnections[humanoid])
+	killHealthConnections[humanoid] = nil
+	killHealthSnapshot[humanoid] = nil
+	npcHumanoids[humanoid] = nil
+end
 
 local function clearNpcCache()
 	disconnect(npcCacheConnection)
 	npcCacheConnection = nil
+	for humanoid in pairs(npcHumanoids) do
+		releaseNpcHumanoid(humanoid)
+	end
 	npcHumanoids = {}
 end
 
-local function cacheNpcHumanoid(humanoid)
-	if humanoid:IsA("Humanoid") then
-		npcHumanoids[humanoid] = true
-		if state.instantKill and not killHealthConnections[humanoid] then
-			local model = humanoid.Parent
-			if model and not Players:GetPlayerFromCharacter(model) then
-				killHealthSnapshot[humanoid] = humanoid.Health
-				killHealthConnections[humanoid] = humanoid.HealthChanged:Connect(function(newHealth)
-					local previousHealth = killHealthSnapshot[humanoid]
-					killHealthSnapshot[humanoid] = newHealth
-					if previousHealth and newHealth < previousHealth then
-						pcall(function() humanoid.Health = 0 end)
-					end
-				end)
-			end
+local function trackInstantKillHumanoid(humanoid)
+	if killHealthConnections[humanoid] then return end
+	local model = humanoid.Parent
+	if not model or Players:GetPlayerFromCharacter(model) then return end
+	killHealthSnapshot[humanoid] = humanoid.Health
+	killHealthConnections[humanoid] = humanoid.HealthChanged:Connect(function(newHealth)
+		local previousHealth = killHealthSnapshot[humanoid]
+		killHealthSnapshot[humanoid] = newHealth
+		if newHealth <= 0 then
+			releaseNpcHumanoid(humanoid)
+		elseif previousHealth and newHealth < previousHealth then
+			pcall(function() humanoid.Health = 0 end)
 		end
+	end)
+end
+
+local function cacheNpcHumanoid(humanoid)
+	if not humanoid:IsA("Humanoid") then return end
+	npcHumanoids[humanoid] = true
+	if state.instantKill then
+		trackInstantKillHumanoid(humanoid)
 	end
 end
 
@@ -388,12 +494,7 @@ end
 
 stopInstantKill = function()
 	state.instantKill = false
-
-	for humanoid, connection in pairs(killHealthConnections) do
-		disconnect(connection)
-		killHealthConnections[humanoid] = nil
-	end
-	killHealthSnapshot = {}
+	instantKillPruneToken += 1
 	clearNpcCache()
 end
 
@@ -403,19 +504,21 @@ local function startInstantKill()
 	state.instantKill = true
 
 	for humanoid in pairs(npcHumanoids) do
-		pcall(function()
-			local model = humanoid.Parent
-			if not model or Players:GetPlayerFromCharacter(model) then return end
-			killHealthSnapshot[humanoid] = humanoid.Health
-			killHealthConnections[humanoid] = humanoid.HealthChanged:Connect(function(newHealth)
-				local previousHealth = killHealthSnapshot[humanoid]
-				killHealthSnapshot[humanoid] = newHealth
-				if previousHealth and newHealth < previousHealth then
-					pcall(function() humanoid.Health = 0 end)
-				end
-			end)
-		end)
+		trackInstantKillHumanoid(humanoid)
 	end
+	instantKillPruneToken += 1
+	local token = instantKillPruneToken
+	task.spawn(function()
+		while state.instantKill and instantKillPruneToken == token do
+			task.wait(2)
+			local ai = Workspace:FindFirstChild("AI")
+			for humanoid in pairs(npcHumanoids) do
+				if not ai or not humanoid:IsDescendantOf(ai) or humanoid.Health <= 0 then
+					releaseNpcHumanoid(humanoid)
+				end
+			end
+		end
+	end)
 end
 
 stopInstantKillNoHit = function()
@@ -432,13 +535,18 @@ local function startInstantKillNoHit()
 
 	task.spawn(function()
 		while noHitLoopActive and state.instantKillNoHit do
+			local ai = Workspace:FindFirstChild("AI")
 			for humanoid in pairs(npcHumanoids) do
-				pcall(function()
-					local model = humanoid.Parent
-					if model and humanoid.Health > 0 and not Players:GetPlayerFromCharacter(model) then
-						humanoid.Health = 0
-					end
-				end)
+				if not ai or not humanoid:IsDescendantOf(ai) or humanoid.Health <= 0 then
+					releaseNpcHumanoid(humanoid)
+				else
+					pcall(function()
+						local model = humanoid.Parent
+						if model and not Players:GetPlayerFromCharacter(model) then
+							humanoid.Health = 0
+						end
+					end)
+				end
 			end
 			task.wait(0.15)
 		end
@@ -446,6 +554,7 @@ local function startInstantKillNoHit()
 end
 
 local TECH_STATS = { "STRENGTH", "TECH", "MORALE" }
+local TECH_LEVEL_KEYS = { STRENGTH = "levelStrength", TECH = "levelTech", MORALE = "levelMorale" }
 local autoFarmToken = 0
 
 local function getRootPart()
@@ -464,6 +573,151 @@ end
 local function getEvent(name)
 	local events = ReplicatedStorage:FindFirstChild("Events")
 	return events and events:FindFirstChild(name)
+end
+
+local function getOwnedPartners()
+	local characters = LocalPlayer:FindFirstChild("Characters")
+	local partners = {}
+	if not characters then return partners end
+
+	for _, raceFolder in ipairs(characters:GetChildren()) do
+		for _, partner in ipairs(raceFolder:GetChildren()) do
+			if partner:IsA("BoolValue") and partner.Value then
+				table.insert(partners, { race = raceFolder.Name, value = partner })
+			end
+		end
+	end
+
+	table.sort(partners, function(first, second)
+		if first.race == second.race then
+			return first.value.Name < second.value.Name
+		end
+		return first.race < second.race
+	end)
+	return partners
+end
+
+local function getSelectedPartner()
+	if state.partnerRace == "" or state.partnerName == "" then return nil end
+	local characters = LocalPlayer:FindFirstChild("Characters")
+	local raceFolder = characters and characters:FindFirstChild(state.partnerRace)
+	local partner = raceFolder and raceFolder:FindFirstChild(state.partnerName)
+	if partner and partner:IsA("BoolValue") and partner.Value then
+		return partner
+	end
+	return nil
+end
+
+local function normalizePlayableName(name)
+	return string.gsub(string.lower(name), "%s+", "")
+end
+
+local upgradeCache = {}
+local upgradeModuleCandidates
+local upgradeCacheOrder = {}
+local UPGRADE_CACHE_LIMIT = 8
+
+local function invalidateUpgradeModuleCache(instance)
+	if not instance:IsA("ModuleScript") then return end
+	upgradeModuleCandidates = nil
+	table.clear(upgradeCache)
+	table.clear(upgradeCacheOrder)
+end
+
+connect(ReplicatedStorage.DescendantAdded:Connect(invalidateUpgradeModuleCache))
+connect(ReplicatedStorage.DescendantRemoving:Connect(invalidateUpgradeModuleCache))
+
+local function cacheUpgradeResult(targetName, result)
+	if not upgradeCache[targetName] then
+		table.insert(upgradeCacheOrder, targetName)
+	end
+	upgradeCache[targetName] = result
+	while #upgradeCacheOrder > UPGRADE_CACHE_LIMIT do
+		local expiredName = table.remove(upgradeCacheOrder, 1)
+		upgradeCache[expiredName] = nil
+	end
+end
+
+local function getUpgradeModuleCandidates()
+	if upgradeModuleCandidates then return upgradeModuleCandidates end
+	local candidates = {}
+	local modulesFolder = ReplicatedStorage:FindFirstChild("Modules")
+		or ReplicatedStorage:FindFirstChild("Playables")
+		or ReplicatedStorage:FindFirstChild("CharacterData")
+	local searchRoot = modulesFolder or ReplicatedStorage
+	for _, descendant in ipairs(searchRoot:GetDescendants()) do
+		if descendant:IsA("ModuleScript") then
+			table.insert(candidates, descendant)
+		end
+	end
+	upgradeModuleCandidates = candidates
+	return candidates
+end
+
+local function findPlayableUpgrades(data, targetName, visited, depth)
+	if type(data) ~= "table" or depth > 8 or visited[data] then return nil end
+	visited[data] = true
+
+	for key, value in pairs(data) do
+		if type(key) == "string" and normalizePlayableName(key) == targetName
+			and type(value) == "table" and type(value.Upgrades) == "table" then
+			return value.Upgrades, key
+		end
+	end
+
+	for _, value in pairs(data) do
+		local upgrades, playableKey = findPlayableUpgrades(value, targetName, visited, depth + 1)
+		if upgrades then return upgrades, playableKey end
+	end
+	return nil
+end
+
+local function getPlayableUpgradeNames(playableName)
+	local targetName = normalizePlayableName(playableName)
+	local cached = upgradeCache[targetName]
+	if cached ~= nil then
+		return cached.names, cached.playableName
+	end
+
+	local candidateModules = table.clone(getUpgradeModuleCandidates())
+	table.sort(candidateModules, function(first, second)
+		local function priority(moduleScript)
+			if normalizePlayableName(moduleScript.Name) == targetName then return 0 end
+			local moduleName = string.lower(moduleScript.Name)
+			if string.find(moduleName, "character") or string.find(moduleName, "playable")
+				or string.find(moduleName, "upgrade") or string.find(moduleName, "data") then
+				return 1
+			end
+			return 2
+		end
+		return priority(first) < priority(second)
+	end)
+
+	for _, moduleScript in ipairs(candidateModules) do
+		local ok, moduleData = pcall(require, moduleScript)
+		if ok then
+			local upgrades, playableKey = findPlayableUpgrades(moduleData, targetName, {}, 0)
+			if not upgrades and normalizePlayableName(moduleScript.Name) == targetName
+				and type(moduleData) == "table" and type(moduleData.Upgrades) == "table" then
+				upgrades, playableKey = moduleData.Upgrades, moduleScript.Name
+			end
+			if upgrades then
+				local names = {}
+				for upgradeName in pairs(upgrades) do
+					if type(upgradeName) == "string" then
+						table.insert(names, upgradeName)
+					end
+				end
+				table.sort(names)
+				cacheUpgradeResult(targetName, { names = names, playableName = playableKey })
+				return names, playableKey
+			end
+		end
+	end
+
+	local emptyResult = { names = {}, playableName = nil }
+	cacheUpgradeResult(targetName, emptyResult)
+	return emptyResult.names, nil
 end
 
 local function getModesFolder()
@@ -512,7 +766,8 @@ local function upgradeTechnology(token)
 	for _, stat in ipairs(TECH_STATS) do
 		local lastLevel = getTechLevel(stat)
 		local stalled = 0
-		while isActive(token) and lastLevel and lastLevel < state.techLevel do
+		local targetLevel = state[TECH_LEVEL_KEYS[stat]]
+		while isActive(token) and lastLevel and lastLevel < targetLevel do
 			upgradeEvent:FireServer(stat, "Normal Scrap")
 			task.wait(0.1)
 			local level = getTechLevel(stat)
@@ -542,13 +797,158 @@ local function getClickRemoteName(name)
 	return CLICK_REMOTE_ALIASES[key] or name
 end
 
-local function findBestNpc(root, skipUntil)
+local function getPlayableRemoteFolder()
+	local remotes = ReplicatedStorage:FindFirstChild("CharacterRemotes")
+	if not remotes then return nil end
+
+	local targetName = normalizePlayableName(getClickRemoteName(state.playableName))
+	for _, folder in ipairs(remotes:GetChildren()) do
+		if normalizePlayableName(folder.Name) == targetName then
+			return folder
+		end
+	end
+	return nil
+end
+
+local function getPlayableSkills()
+	local folder = getPlayableRemoteFolder()
+	if not folder then return {} end
+
+	local skills = {}
+	for _, remote in ipairs(folder:GetChildren()) do
+		if remote:IsA("RemoteEvent") and string.lower(remote.Name) ~= "click" then
+			table.insert(skills, remote)
+		end
+	end
+	return skills
+end
+
+local function getSelectedSkillRemotes()
+	local folder = getPlayableRemoteFolder()
+	if not folder then return {} end
+
+	local selected = state.selectedSkills[folder.Name]
+	if type(selected) ~= "table" then
+		selected = {}
+		state.selectedSkills[folder.Name] = selected
+	end
+
+	local skills = {}
+	for _, remote in ipairs(getPlayableSkills()) do
+		if selected[remote.Name] ~= false then
+			table.insert(skills, remote)
+		end
+	end
+	return skills
+end
+
+local function isSkillOnCooldown(skillName)
+	local playerModel = Workspace:FindFirstChild(LocalPlayer.Name)
+		or Workspace:FindFirstChild(LocalPlayer.DisplayName)
+	local cooldowns = playerModel and playerModel:FindFirstChild("CooldownsFolder")
+	local cooldown = cooldowns and cooldowns:FindFirstChild(skillName)
+	if not cooldown then return false end
+
+	if cooldown:IsA("BoolValue") then
+		return cooldown.Value
+	elseif cooldown:IsA("NumberValue") or cooldown:IsA("IntValue") then
+		return cooldown.Value > 0
+	elseif cooldown:IsA("StringValue") then
+		return (tonumber(cooldown.Value) or 1) > 0
+	end
+	return true
+end
+
+local function getUsingSkillValue()
+	local playerModel = Workspace:FindFirstChild(LocalPlayer.Name)
+		or Workspace:FindFirstChild(LocalPlayer.DisplayName)
+	local usingSkill = playerModel and playerModel:FindFirstChild("UsingSkill", true)
+	if usingSkill and usingSkill:IsA("BoolValue") then
+		return usingSkill
+	end
+	return nil
+end
+
+local function fireAndWaitForUsingSkill(token, model, humanoid, usingSkill, callback, duringAction)
+	local sawSkillActive = false
+	local finished = false
+	local connection = usingSkill:GetPropertyChangedSignal("Value"):Connect(function()
+		if usingSkill.Value then
+			sawSkillActive = true
+		elseif sawSkillActive then
+			finished = true
+		end
+	end)
+	local ok, result = xpcall(function()
+		local callbackOk = pcall(callback)
+		if not callbackOk then return false end
+
+		while isActive(token) and model.Parent and humanoid.Health > 0 and not finished do
+			if usingSkill.Value then
+				sawSkillActive = true
+			elseif sawSkillActive then
+				finished = true
+			end
+			if not finished then
+				if duringAction then
+					pcall(duringAction)
+				end
+				task.wait(0.05)
+			end
+		end
+		return true
+	end, function()
+		return false
+	end)
+	if connection.Connected then
+		connection:Disconnect()
+	end
+	return ok and result == true
+end
+
+local cachedNpcModels = {}
+local cachedNpcFolder
+local cachedNpcAddedConnection
+local cachedNpcRemovedConnection
+
+local function clearCachedNpcModels()
+	disconnect(cachedNpcAddedConnection)
+	disconnect(cachedNpcRemovedConnection)
+	cachedNpcAddedConnection = nil
+	cachedNpcRemovedConnection = nil
+	cachedNpcFolder = nil
+	table.clear(cachedNpcModels)
+end
+
+local function getCachedNpcModels()
 	local ai = Workspace:FindFirstChild("AI")
+	if ai == cachedNpcFolder then
+		return cachedNpcModels, ai
+	end
+
+	clearCachedNpcModels()
+	cachedNpcFolder = ai
+	if ai then
+		for _, model in ipairs(ai:GetChildren()) do
+			cachedNpcModels[model] = true
+		end
+		cachedNpcAddedConnection = connect(ai.ChildAdded:Connect(function(model)
+			cachedNpcModels[model] = true
+		end))
+		cachedNpcRemovedConnection = connect(ai.ChildRemoved:Connect(function(model)
+			cachedNpcModels[model] = nil
+		end))
+	end
+	return cachedNpcModels, ai
+end
+
+local function findBestNpc(root, skipUntil)
+	local npcModels, ai = getCachedNpcModels()
 	if not ai then return nil end
 
 	local now = os.clock()
 	local bestModel, bestHumanoid, bestPart, bestHealth, bestDistance
-	for _, model in ipairs(ai:GetChildren()) do
+	for model in pairs(npcModels) do
 		if model:IsA("Model")
 			and not Players:GetPlayerFromCharacter(model)
 			and not isAllyName(model.Name)
@@ -572,11 +972,7 @@ local function findBestNpc(root, skipUntil)
 	return bestModel, bestHumanoid, bestPart
 end
 
-local ATTACK_DELAY = 0.1
-local COMBO_STEP_DELAY = 0.25
-local HOVER_HEIGHT = 140
-local HOLD_INTERVAL = 0.05
-local ROUND_RESET_DELAY = 5
+local ATTACK_INTERVAL = 0.5
 
 local function setPlatformStand(value)
 	local humanoid = getHumanoid()
@@ -585,23 +981,23 @@ local function setPlatformStand(value)
 	end
 end
 
-local ROUND_END_CONFIRM = 3
-local noVoteSince = nil
+local function isModeSelectionOpen()
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	local modeSelection = playerGui and playerGui:FindFirstChild("Mode Selection")
+	return modeSelection ~= nil and modeSelection.Enabled == true
+end
 
 local function roundEnded()
-	if not getModesFolder() or hasVotedMode() then
-		noVoteSince = nil
-		return false
-	end
-	noVoteSince = noVoteSince or os.clock()
-	return os.clock() - noVoteSince >= ROUND_END_CONFIRM
+	return isModeSelectionOpen() and not hasVotedMode()
 end
 
 local function attackNpc(token, model, humanoid, part, skipUntil)
 	local startTime = os.clock()
 	local lastRetarget = os.clock()
-	local nextClickAt = 0
-	local comboIndex = 0
+	local pendingRetargetHealth
+	local skills = getSelectedSkillRemotes()
+	local skillIndex = 1
+	local usingSkillValue = getUsingSkillValue()
 	local isBoss = humanoid.MaxHealth >= BOSS_HEALTH
 
 	local halfHeight = 3
@@ -609,6 +1005,19 @@ local function attackNpc(token, model, humanoid, part, skipUntil)
 		local _, size = model:GetBoundingBox()
 		halfHeight = size.Y / 2
 	end)
+	local function maintainHover()
+		local ownHumanoid = getHumanoid()
+		local root = getRootPart()
+		if not root or not ownHumanoid or ownHumanoid.Health <= 0 or not part.Parent then return end
+		if not ownHumanoid.PlatformStand then
+			ownHumanoid.PlatformStand = true
+		end
+		local npcPosition = part.Position
+		local hoverPosition = Vector3.new(npcPosition.X, npcPosition.Y + halfHeight + state.hoverHeight, npcPosition.Z)
+		root.CFrame = CFrame.new(hoverPosition) * CFrame.Angles(-math.pi / 2, 0, 0)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
 
 	while isActive(token) and model.Parent and part.Parent and humanoid.Health > 0 do
 		local ownHumanoid = getHumanoid()
@@ -619,45 +1028,58 @@ local function attackNpc(token, model, humanoid, part, skipUntil)
 			ownHumanoid.PlatformStand = true
 		end
 
-		local npcPosition = part.Position
-		local hoverPosition = Vector3.new(npcPosition.X, npcPosition.Y + halfHeight + HOVER_HEIGHT, npcPosition.Z)
-		root.CFrame = CFrame.new(hoverPosition) * CFrame.Angles(-math.pi / 2, 0, 0)
-		root.AssemblyLinearVelocity = Vector3.zero
-		root.AssemblyAngularVelocity = Vector3.zero
+		maintainHover()
 
-		if os.clock() >= nextClickAt then
-			comboIndex += 1
-			local step = comboIndex
-			if comboIndex >= state.attackIndex then
-				comboIndex = 0
-				nextClickAt = os.clock() + ATTACK_DELAY
-			else
-				nextClickAt = os.clock() + COMBO_STEP_DELAY
+		if usingSkillValue and not usingSkillValue.Value then
+			local readySkill = nil
+			local readySkillIndex = nil
+			for offset = 0, #skills - 1 do
+				local index = ((skillIndex + offset - 1) % #skills) + 1
+				if not isSkillOnCooldown(skills[index].Name) then
+					readySkill = skills[index]
+					readySkillIndex = index
+					break
+				end
 			end
-			pcall(function()
-				local remotes = ReplicatedStorage:FindFirstChild("CharacterRemotes")
-				local playableRemotes = remotes and remotes:FindFirstChild(getClickRemoteName(state.playableName))
+	
+			if readySkill then
+				local ok = fireAndWaitForUsingSkill(token, model, humanoid, usingSkillValue, function()
+					readySkill:FireServer()
+				end, maintainHover)
+				if ok then
+					skillIndex = readySkillIndex % #skills + 1
+				end
+			else
+				local playableRemotes = getPlayableRemoteFolder()
 				local click = playableRemotes and playableRemotes:FindFirstChild("Click")
 				if click then
-					click:FireServer(step)
+					fireAndWaitForUsingSkill(token, model, humanoid, usingSkillValue, function()
+						click:FireServer(state.attackIndex)
+					end, maintainHover)
 				end
-			end)
-		end
-
-		if os.clock() - lastRetarget >= 1 then
-			lastRetarget = os.clock()
-			if roundEnded() then return end
-			local bestModel, bestHumanoid = findBestNpc(root, skipUntil)
-			if bestModel and bestModel ~= model and bestHumanoid.Health < humanoid.Health then
-				return
 			end
 		end
 
-		if not isBoss and os.clock() - startTime > 20 then
+		if pendingRetargetHealth and (humanoid.Health <= 0 or humanoid.Health < pendingRetargetHealth) then
+			return
+		end
+
+		if os.clock() - lastRetarget >= ATTACK_INTERVAL then
+			lastRetarget = os.clock()
+			if roundEnded() then return end
+			if not pendingRetargetHealth then
+				local bestModel, bestHumanoid = findBestNpc(root, skipUntil)
+				if bestModel and bestModel ~= model and bestHumanoid.Health < humanoid.Health then
+					pendingRetargetHealth = humanoid.Health
+				end
+			end
+		end
+
+		if not pendingRetargetHealth and not isBoss and os.clock() - startTime > 20 then
 			skipUntil[model] = os.clock() + 30
 			return
 		end
-		task.wait(HOLD_INTERVAL)
+		task.wait(0.05)
 	end
 end
 
@@ -675,7 +1097,6 @@ end
 
 local function farmNpcs(token)
 	local skipUntil = {}
-	noVoteSince = nil
 	while isActive(token) do
 		local ownHumanoid = getHumanoid()
 		local root = getRootPart()
@@ -696,6 +1117,21 @@ local function farmNpcs(token)
 				attackNpc(token, model, humanoid, part, skipUntil)
 			else
 				setPlatformStand(false)
+				local baseThings = Workspace:FindFirstChild("BaseThings")
+				local npcSpawnPosition = baseThings and baseThings:FindFirstChild("NPCSpawnPosition")
+				local allies = npcSpawnPosition and npcSpawnPosition:FindFirstChild("Allies")
+				local spawnPart = allies and allies:FindFirstChild("Part")
+				if root and spawnPart and spawnPart:IsA("BasePart") then
+					local offset = Vector3.new(
+						spawnPart.Position.X - root.Position.X,
+						0,
+						spawnPart.Position.Z - root.Position.Z
+					)
+					root.CFrame += offset
+					local velocity = root.AssemblyLinearVelocity
+					root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+					root.AssemblyAngularVelocity = Vector3.zero
+				end
 				task.wait(0.5)
 			end
 		end
@@ -714,7 +1150,16 @@ local function waitForRespawn(token)
 	end
 end
 
+local function waitForModeSelection(token)
+	while isActive(token) and not hasVotedMode() and not isModeSelectionOpen() do
+		task.wait(0.25)
+	end
+end
+
 local function autoFarmCycle(token)
+	waitForModeSelection(token)
+	if not isActive(token) then return end
+
 	if not hasVotedMode() then
 		local voteEvent = getEvent("ModeVote") or getEvent("ModeVoteEvent")
 		if voteEvent then
@@ -756,7 +1201,6 @@ local function autoFarmCycle(token)
 	while isActive(token) and hasVotedMode() do
 		task.wait(0.5)
 	end
-	task.wait(ROUND_RESET_DELAY)
 end
 
 local function startAutoFarm()
@@ -778,11 +1222,72 @@ end
 local function stopAutoFarm()
 	state.autoFarm = false
 	autoFarmToken += 1
+	clearCachedNpcModels()
 	setPlatformStand(false)
 end
 
-if not advanceIntegrity(1, 2) then
-	return
+local autoPurchaseUpgradeToken = 0
+
+local function startAutoPurchaseUpgrade()
+	if state.autoPurchaseUpgrade then return end
+	state.autoPurchaseUpgrade = true
+	autoPurchaseUpgradeToken += 1
+	local token = autoPurchaseUpgradeToken
+
+	task.spawn(function()
+		local upgradeIndex = 1
+		while state.autoPurchaseUpgrade and autoPurchaseUpgradeToken == token do
+			local upgrades, playableName = getPlayableUpgradeNames(state.playableName)
+			local purchaseItem = ReplicatedStorage:FindFirstChild("PurchaseItem")
+			if #upgrades > 0 and playableName and purchaseItem then
+				upgradeIndex = ((upgradeIndex - 1) % #upgrades) + 1
+				pcall(function()
+					purchaseItem:InvokeServer(playableName, upgrades[upgradeIndex])
+				end)
+				upgradeIndex += 1
+			end
+			task.wait(5)
+		end
+	end)
+end
+
+local function stopAutoPurchaseUpgrade()
+	state.autoPurchaseUpgrade = false
+	autoPurchaseUpgradeToken += 1
+end
+
+local autoSpawnPartnerToken = 0
+
+local function startAutoSpawnPartner()
+	if state.autoSpawnPartner then return end
+	state.autoSpawnPartner = true
+	autoSpawnPartnerToken += 1
+	local token = autoSpawnPartnerToken
+
+	task.spawn(function()
+		while state.autoSpawnPartner and autoSpawnPartnerToken == token do
+			local partner = getSelectedPartner()
+			local inventorySelect = getEvent("InventorySelect")
+			local spawnPartner = getEvent("SpawnPartner")
+			if partner and inventorySelect and spawnPartner then
+				pcall(function()
+					inventorySelect:FireServer("CharacterSelect", partner)
+				end)
+				task.wait(0.25)
+				if state.autoSpawnPartner and autoSpawnPartnerToken == token then
+					pcall(function()
+						spawnPartner:FireServer(partner.Name)
+					end)
+				end
+			end
+			task.wait(3)
+		end
+	end)
+end
+
+local function stopAutoSpawnPartner()
+	state.autoSpawnPartner = false
+	autoSpawnPartnerToken += 1
 end
 
 local gui = Instance.new("ScreenGui")
@@ -905,7 +1410,8 @@ local settingsPage = createPage("Settings")
 local playerPage = createPage("Player")
 local content = homePage
 
-local function createToggle(text, default, callback)
+local function createToggle(text, default, callback, parentOverride)
+	local parent = parentOverride or content
 	local button = Instance.new("TextButton")
 	button.Size = UDim2.new(1, -4, 0, 30)
 	button.BackgroundColor3 = default and COLORS.controlOn or COLORS.control
@@ -917,7 +1423,7 @@ local function createToggle(text, default, callback)
 	button.BorderColor3 = COLORS.border
 	button.AutoButtonColor = false
 	button.ZIndex = 12
-	button.Parent = content
+	button.Parent = parent
 	local corner = Instance.new("UICorner")
 	corner.CornerRadius = UDim.new(0, 10)
 	corner.Parent = button
@@ -935,13 +1441,14 @@ local function createToggle(text, default, callback)
 	end)
 end
 
-local function createNumberInput(text, value, callback)
+local function createNumberInput(text, value, callback, parentOverride)
+	local parent = parentOverride or content
 	local row = Instance.new("Frame")
 	row.Size = UDim2.new(1, -4, 0, 30)
 	row.BackgroundColor3 = COLORS.background
 	row.BorderColor3 = COLORS.border
 	row.ZIndex = 12
-	row.Parent = content
+	row.Parent = parent
 	local rowCorner = Instance.new("UICorner")
 	rowCorner.CornerRadius = UDim.new(0, 10)
 	rowCorner.Parent = row
@@ -987,13 +1494,14 @@ local function createNumberInput(text, value, callback)
 	end)
 end
 
-local function createTextInput(text, value, callback)
+local function createTextInput(text, value, callback, parentOverride)
+	local parent = parentOverride or content
 	local row = Instance.new("Frame")
 	row.Size = UDim2.new(1, -4, 0, 30)
 	row.BackgroundColor3 = COLORS.background
 	row.BorderColor3 = COLORS.border
 	row.ZIndex = 12
-	row.Parent = content
+	row.Parent = parent
 	local rowCorner = Instance.new("UICorner")
 	rowCorner.CornerRadius = UDim.new(0, 10)
 	rowCorner.Parent = row
@@ -1036,6 +1544,601 @@ local function createTextInput(text, value, callback)
 			callback(trimmed)
 		end
 		box.Text = current
+	end)
+end
+
+local function createSectionHeader(text)
+	local header = Instance.new("TextLabel")
+	header.Size = UDim2.new(1, -4, 0, 28)
+	header.BackgroundTransparency = 1
+	header.TextColor3 = COLORS.text
+	header.Text = text
+	header.TextSize = 17
+	header.Font = Enum.Font.SourceSansBold
+	header.TextXAlignment = Enum.TextXAlignment.Left
+	header.ZIndex = 13
+	header.Parent = content
+end
+
+local function createSection(title, build)
+	local section = Instance.new("Frame")
+	section.Name = string.gsub(title, "%s+", "")
+	section.Size = UDim2.new(1, -4, 0, 0)
+	section.AutomaticSize = Enum.AutomaticSize.Y
+	section.BackgroundTransparency = 1
+	section.BorderSizePixel = 0
+	section.ZIndex = 12
+	section.Parent = content
+
+	local sectionLayout = Instance.new("UIListLayout")
+	sectionLayout.Padding = UDim.new(0, 6)
+	sectionLayout.FillDirection = Enum.FillDirection.Vertical
+	sectionLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+	sectionLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	sectionLayout.Parent = section
+
+	local header = Instance.new("TextLabel")
+	header.LayoutOrder = -1
+	header.Size = UDim2.new(1, 0, 0, 28)
+	header.BackgroundTransparency = 1
+	header.TextColor3 = COLORS.text
+	header.Text = title
+	header.TextSize = 17
+	header.Font = Enum.Font.SourceSansBold
+	header.TextXAlignment = Enum.TextXAlignment.Left
+	header.ZIndex = 13
+	header.Parent = section
+
+	build(section)
+end
+
+local function createPartnerPicker(parentOverride)
+	local parent = parentOverride or content
+	local picker = Instance.new("Frame")
+	picker.Size = UDim2.new(1, -4, 0, 34)
+	picker.BackgroundTransparency = 1
+	picker.ZIndex = 14
+	picker.Parent = parent
+
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(1, 0, 0, 30)
+	button.Position = UDim2.fromOffset(0, 2)
+	button.BackgroundColor3 = COLORS.control
+	button.TextColor3 = COLORS.text
+	button.TextSize = 15
+	button.Font = Enum.Font.SourceSans
+	button.TextXAlignment = Enum.TextXAlignment.Left
+	button.TextTruncate = Enum.TextTruncate.AtEnd
+	button.BorderColor3 = COLORS.border
+	button.AutoButtonColor = false
+	button.ZIndex = 15
+	button.Parent = picker
+	local buttonPadding = Instance.new("UIPadding")
+	buttonPadding.PaddingLeft = UDim.new(0, 10)
+	buttonPadding.PaddingRight = UDim.new(0, 28)
+	buttonPadding.Parent = button
+	local buttonCorner = Instance.new("UICorner")
+	buttonCorner.CornerRadius = UDim.new(0, 8)
+	buttonCorner.Parent = button
+	local arrow = Instance.new("TextLabel")
+	arrow.Size = UDim2.fromOffset(24, 30)
+	arrow.Position = UDim2.new(1, -28, 0, 2)
+	arrow.BackgroundTransparency = 1
+	arrow.Text = "▼"
+	arrow.TextColor3 = COLORS.text
+	arrow.TextSize = 14
+	arrow.Font = Enum.Font.SourceSansBold
+	arrow.ZIndex = 16
+	arrow.Parent = picker
+
+	local options = Instance.new("ScrollingFrame")
+	options.Position = UDim2.fromOffset(0, 34)
+	options.Size = UDim2.new(1, 0, 0, 146)
+	options.BackgroundColor3 = COLORS.background
+	options.BorderColor3 = COLORS.border
+	options.ScrollBarThickness = 6
+	options.CanvasSize = UDim2.new()
+	options.Visible = false
+	options.ZIndex = 16
+	options.Parent = picker
+	local optionsLayout = Instance.new("UIListLayout")
+	optionsLayout.Padding = UDim.new(0, 2)
+	optionsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	optionsLayout.Parent = options
+	optionsLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		options.CanvasSize = UDim2.fromOffset(0, optionsLayout.AbsoluteContentSize.Y + 4)
+	end)
+	local renderedPartners
+	local partnerIndicators = {}
+
+	local function updateButtonText()
+		local partner = getSelectedPartner()
+		button.Text = partner and ("Choose partner: " .. state.partnerRace .. " / " .. partner.Name) or "Choose partner"
+	end
+
+	local function updatePartnerIndicators()
+		for _, entry in ipairs(partnerIndicators) do
+			local selected = state.partnerRace == entry.race and state.partnerName == entry.name
+			entry.indicator.BackgroundColor3 = selected and COLORS.controlOn or COLORS.muted
+		end
+	end
+
+	local function clearOptions()
+		for _, child in ipairs(options:GetChildren()) do
+			if child ~= optionsLayout then
+				child:Destroy()
+			end
+		end
+	end
+
+	local function refreshOptions()
+		local ownedPartners = getOwnedPartners()
+		local unchanged = renderedPartners and #renderedPartners == #ownedPartners
+		if unchanged then
+			for index, entry in ipairs(ownedPartners) do
+				if renderedPartners[index].value ~= entry.value or renderedPartners[index].race ~= entry.race then
+					unchanged = false
+					break
+				end
+			end
+		end
+		if unchanged then
+			updatePartnerIndicators()
+			return
+		end
+		renderedPartners = ownedPartners
+		table.clear(partnerIndicators)
+		clearOptions()
+		if #ownedPartners == 0 then
+			local emptyLabel = Instance.new("TextLabel")
+			emptyLabel.Size = UDim2.new(1, -12, 0, 30)
+			emptyLabel.Position = UDim2.fromOffset(6, 0)
+			emptyLabel.BackgroundTransparency = 1
+			emptyLabel.TextColor3 = COLORS.muted
+			emptyLabel.Text = "No owned partners found"
+			emptyLabel.TextSize = 14
+			emptyLabel.Font = Enum.Font.SourceSans
+			emptyLabel.TextXAlignment = Enum.TextXAlignment.Left
+			emptyLabel.ZIndex = 17
+			emptyLabel.Parent = options
+			return
+		end
+
+		local lastRace
+		for _, entry in ipairs(ownedPartners) do
+			if entry.race ~= lastRace then
+				lastRace = entry.race
+				local heading = Instance.new("TextLabel")
+				heading.Size = UDim2.new(1, -12, 0, 25)
+				heading.Position = UDim2.fromOffset(6, 0)
+				heading.BackgroundTransparency = 1
+				heading.TextColor3 = COLORS.text
+				heading.Text = entry.race .. " Partner"
+				heading.TextSize = 16
+				heading.Font = Enum.Font.SourceSansBold
+				heading.TextXAlignment = Enum.TextXAlignment.Center
+				heading.ZIndex = 17
+				heading.Parent = options
+			end
+
+			local partner = entry.value
+			local selected = state.partnerRace == entry.race and state.partnerName == partner.Name
+			local option = Instance.new("TextButton")
+			option.Size = UDim2.new(1, -8, 0, 30)
+			option.BackgroundColor3 = COLORS.background
+			option.Text = partner.Name
+			option.TextColor3 = COLORS.text
+			option.TextSize = 14
+			option.Font = Enum.Font.SourceSans
+			option.TextXAlignment = Enum.TextXAlignment.Left
+			option.BorderColor3 = COLORS.border
+			option.AutoButtonColor = false
+			option.ZIndex = 17
+			option.Parent = options
+			local optionPadding = Instance.new("UIPadding")
+			optionPadding.PaddingLeft = UDim.new(0, 10)
+			optionPadding.PaddingRight = UDim.new(0, 30)
+			optionPadding.Parent = option
+
+			local indicator = Instance.new("Frame")
+			indicator.Size = UDim2.fromOffset(16, 16)
+			indicator.Position = UDim2.new(1, -23, 0.5, -8)
+			indicator.BackgroundColor3 = selected and COLORS.controlOn or COLORS.muted
+			indicator.BorderSizePixel = 0
+			indicator.ZIndex = 18
+			indicator.Parent = option
+			local indicatorCorner = Instance.new("UICorner")
+			indicatorCorner.CornerRadius = UDim.new(1, 0)
+			indicatorCorner.Parent = indicator
+			table.insert(partnerIndicators, { race = entry.race, name = partner.Name, indicator = indicator })
+
+			option.MouseButton1Click:Connect(function()
+				state.partnerRace = entry.race
+				state.partnerName = partner.Name
+				saveConfig()
+				updateButtonText()
+				updatePartnerIndicators()
+				options.Visible = false
+				picker.Size = UDim2.new(1, -4, 0, 34)
+			end)
+		end
+	end
+
+	updateButtonText()
+	button.MouseButton1Click:Connect(function()
+		options.Visible = not options.Visible
+		if options.Visible then
+			refreshOptions()
+			picker.Size = UDim2.new(1, -4, 0, 184)
+		else
+			picker.Size = UDim2.new(1, -4, 0, 34)
+		end
+	end)
+end
+
+local function createModePicker(parentOverride)
+	local parent = parentOverride or content
+	local picker = Instance.new("Frame")
+	picker.Size = UDim2.new(1, -4, 0, 34)
+	picker.BackgroundTransparency = 1
+	picker.ZIndex = 14
+	picker.Parent = parent
+
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(1, 0, 0, 30)
+	button.Position = UDim2.fromOffset(0, 2)
+	button.BackgroundColor3 = COLORS.control
+	button.TextColor3 = COLORS.text
+	button.Text = "Choose mode: " .. state.modeName
+	button.TextSize = 15
+	button.Font = Enum.Font.SourceSans
+	button.TextXAlignment = Enum.TextXAlignment.Left
+	button.TextTruncate = Enum.TextTruncate.AtEnd
+	button.BorderColor3 = COLORS.border
+	button.AutoButtonColor = false
+	button.ZIndex = 15
+	button.Parent = picker
+	local buttonPadding = Instance.new("UIPadding")
+	buttonPadding.PaddingLeft = UDim.new(0, 10)
+	buttonPadding.PaddingRight = UDim.new(0, 28)
+	buttonPadding.Parent = button
+	local buttonCorner = Instance.new("UICorner")
+	buttonCorner.CornerRadius = UDim.new(0, 8)
+	buttonCorner.Parent = button
+	local arrow = Instance.new("TextLabel")
+	arrow.Size = UDim2.fromOffset(24, 30)
+	arrow.Position = UDim2.new(1, -28, 0, 2)
+	arrow.BackgroundTransparency = 1
+	arrow.Text = "▼"
+	arrow.TextColor3 = COLORS.text
+	arrow.TextSize = 14
+	arrow.Font = Enum.Font.SourceSansBold
+	arrow.ZIndex = 16
+	arrow.Parent = picker
+
+	local options = Instance.new("ScrollingFrame")
+	options.Position = UDim2.fromOffset(0, 34)
+	options.Size = UDim2.new(1, 0, 0, 146)
+	options.BackgroundColor3 = COLORS.background
+	options.BorderColor3 = COLORS.border
+	options.ScrollBarThickness = 6
+	options.CanvasSize = UDim2.new()
+	options.Visible = false
+	options.ZIndex = 16
+	options.Parent = picker
+	local optionsLayout = Instance.new("UIListLayout")
+	optionsLayout.Padding = UDim.new(0, 2)
+	optionsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	optionsLayout.Parent = options
+	optionsLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		options.CanvasSize = UDim2.fromOffset(0, optionsLayout.AbsoluteContentSize.Y + 4)
+	end)
+	local renderedModes
+	local modeIndicators = {}
+
+	local function updateModeIndicators()
+		for _, entry in ipairs(modeIndicators) do
+			local selected = string.lower(entry.mode.Name) == string.lower(state.modeName)
+			entry.indicator.BackgroundColor3 = selected and COLORS.controlOn or COLORS.muted
+		end
+	end
+
+	local function refreshOptions()
+		local modesFolder = getModesFolder()
+		local modes = {}
+		if modesFolder then
+			for _, mode in ipairs(modesFolder:GetChildren()) do
+				if mode:IsA("BoolValue") then
+					table.insert(modes, mode)
+				end
+			end
+		end
+		local unchanged = renderedModes and #renderedModes == #modes
+		if unchanged then
+			for index, mode in ipairs(modes) do
+				if renderedModes[index] ~= mode then
+					unchanged = false
+					break
+				end
+			end
+		end
+		if unchanged then
+			updateModeIndicators()
+			local selectedMode
+			for _, mode in ipairs(modes) do
+				if string.lower(mode.Name) == string.lower(state.modeName) then
+					selectedMode = mode
+					break
+				end
+			end
+			button.Text = selectedMode and ("Choose mode: " .. selectedMode.Name) or "Choose mode"
+			return
+		end
+		renderedModes = modes
+		table.clear(modeIndicators)
+		for _, child in ipairs(options:GetChildren()) do
+			if child ~= optionsLayout then
+				child:Destroy()
+			end
+		end
+
+		if #modes == 0 then
+			local emptyLabel = Instance.new("TextLabel")
+			emptyLabel.Size = UDim2.new(1, -12, 0, 30)
+			emptyLabel.Position = UDim2.fromOffset(6, 0)
+			emptyLabel.BackgroundTransparency = 1
+			emptyLabel.TextColor3 = COLORS.muted
+			emptyLabel.Text = "No modes found"
+			emptyLabel.TextSize = 14
+			emptyLabel.Font = Enum.Font.SourceSans
+			emptyLabel.TextXAlignment = Enum.TextXAlignment.Left
+			emptyLabel.ZIndex = 17
+			emptyLabel.Parent = options
+			button.Text = "Choose mode"
+			return
+		end
+
+		local selectedMode
+		for _, mode in ipairs(modes) do
+			if string.lower(mode.Name) == string.lower(state.modeName) then
+				selectedMode = mode
+			end
+
+			local option = Instance.new("TextButton")
+			option.Size = UDim2.new(1, -8, 0, 30)
+			option.BackgroundColor3 = COLORS.background
+			option.Text = mode.Name
+			option.TextColor3 = COLORS.text
+			option.TextSize = 14
+			option.Font = Enum.Font.SourceSans
+			option.TextXAlignment = Enum.TextXAlignment.Left
+			option.BorderColor3 = COLORS.border
+			option.AutoButtonColor = false
+			option.ZIndex = 17
+			option.Parent = options
+			local optionPadding = Instance.new("UIPadding")
+			optionPadding.PaddingLeft = UDim.new(0, 10)
+			optionPadding.PaddingRight = UDim.new(0, 30)
+			optionPadding.Parent = option
+
+			local indicator = Instance.new("Frame")
+			indicator.Size = UDim2.fromOffset(16, 16)
+			indicator.Position = UDim2.new(1, -23, 0.5, -8)
+			indicator.BackgroundColor3 = mode == selectedMode and COLORS.controlOn or COLORS.muted
+			indicator.BorderSizePixel = 0
+			indicator.ZIndex = 18
+			indicator.Parent = option
+			local indicatorCorner = Instance.new("UICorner")
+			indicatorCorner.CornerRadius = UDim.new(1, 0)
+			indicatorCorner.Parent = indicator
+			table.insert(modeIndicators, { mode = mode, indicator = indicator })
+
+			option.MouseButton1Click:Connect(function()
+				state.modeName = mode.Name
+				button.Text = "Choose mode: " .. mode.Name
+				updateModeIndicators()
+				saveConfig()
+				options.Visible = false
+				picker.Size = UDim2.new(1, -4, 0, 34)
+			end)
+		end
+
+		button.Text = selectedMode and ("Choose mode: " .. selectedMode.Name) or "Choose mode"
+	end
+
+	button.MouseButton1Click:Connect(function()
+		options.Visible = not options.Visible
+		if options.Visible then
+			refreshOptions()
+			picker.Size = UDim2.new(1, -4, 0, 184)
+		else
+			picker.Size = UDim2.new(1, -4, 0, 34)
+		end
+	end)
+end
+
+local function createSkillPicker(parentOverride)
+	local parent = parentOverride or content
+	local picker = Instance.new("Frame")
+	picker.Size = UDim2.new(1, -4, 0, 34)
+	picker.BackgroundTransparency = 1
+	picker.ZIndex = 14
+	picker.Parent = parent
+
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(1, 0, 0, 30)
+	button.Position = UDim2.fromOffset(0, 2)
+	button.BackgroundColor3 = COLORS.control
+	button.TextColor3 = COLORS.text
+	button.Text = "Choose Skill Playable"
+	button.TextSize = 15
+	button.Font = Enum.Font.SourceSans
+	button.TextXAlignment = Enum.TextXAlignment.Left
+	button.BorderColor3 = COLORS.border
+	button.AutoButtonColor = false
+	button.ZIndex = 15
+	button.Parent = picker
+	local buttonPadding = Instance.new("UIPadding")
+	buttonPadding.PaddingLeft = UDim.new(0, 10)
+	buttonPadding.PaddingRight = UDim.new(0, 28)
+	buttonPadding.Parent = button
+	local buttonCorner = Instance.new("UICorner")
+	buttonCorner.CornerRadius = UDim.new(0, 8)
+	buttonCorner.Parent = button
+	local arrow = Instance.new("TextLabel")
+	arrow.Size = UDim2.fromOffset(24, 30)
+	arrow.Position = UDim2.new(1, -28, 0, 2)
+	arrow.BackgroundTransparency = 1
+	arrow.Text = "▼"
+	arrow.TextColor3 = COLORS.text
+	arrow.TextSize = 14
+	arrow.Font = Enum.Font.SourceSansBold
+	arrow.ZIndex = 16
+	arrow.Parent = picker
+
+	local options = Instance.new("ScrollingFrame")
+	options.Position = UDim2.fromOffset(0, 34)
+	options.Size = UDim2.new(1, 0, 0, 146)
+	options.BackgroundColor3 = COLORS.background
+	options.BorderColor3 = COLORS.border
+	options.ScrollBarThickness = 6
+	options.CanvasSize = UDim2.new()
+	options.Visible = false
+	options.ZIndex = 16
+	options.Parent = picker
+	local optionsLayout = Instance.new("UIListLayout")
+	optionsLayout.Padding = UDim.new(0, 2)
+	optionsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	optionsLayout.Parent = options
+	optionsLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		options.CanvasSize = UDim2.fromOffset(0, optionsLayout.AbsoluteContentSize.Y + 4)
+	end)
+	local renderedPlayableFolder
+	local renderedSkills
+	local skillIndicators = {}
+
+	local function updateSkillIndicators(selection)
+		for _, entry in ipairs(skillIndicators) do
+			local selected = selection[entry.name] ~= false
+			entry.indicator.BackgroundColor3 = selected and COLORS.controlOn or COLORS.muted
+		end
+	end
+
+	local function clearOptions()
+		for _, child in ipairs(options:GetChildren()) do
+			if child ~= optionsLayout then
+				child:Destroy()
+			end
+		end
+	end
+
+	local function refreshOptions()
+		local playableFolder = getPlayableRemoteFolder()
+		local skills = getPlayableSkills()
+		local unchanged = renderedSkills and renderedPlayableFolder == playableFolder and #renderedSkills == #skills
+		if unchanged then
+			for index, skill in ipairs(skills) do
+				if renderedSkills[index] ~= skill then
+					unchanged = false
+					break
+				end
+			end
+		end
+		if unchanged then
+			if playableFolder then
+				local selection = state.selectedSkills[playableFolder.Name]
+				if type(selection) ~= "table" then
+					selection = {}
+					state.selectedSkills[playableFolder.Name] = selection
+				end
+				updateSkillIndicators(selection)
+			end
+			return
+		end
+		renderedPlayableFolder = playableFolder
+		renderedSkills = skills
+		table.clear(skillIndicators)
+		clearOptions()
+		if not playableFolder or #skills == 0 then
+			local emptyLabel = Instance.new("TextLabel")
+			emptyLabel.Size = UDim2.new(1, -12, 0, 30)
+			emptyLabel.Position = UDim2.fromOffset(6, 0)
+			emptyLabel.BackgroundTransparency = 1
+			emptyLabel.TextColor3 = COLORS.muted
+			emptyLabel.Text = "No skills found for this playable"
+			emptyLabel.TextSize = 14
+			emptyLabel.Font = Enum.Font.SourceSans
+			emptyLabel.TextXAlignment = Enum.TextXAlignment.Left
+			emptyLabel.ZIndex = 17
+			emptyLabel.Parent = options
+			return
+		end
+
+		local selection = state.selectedSkills[playableFolder.Name]
+		if type(selection) ~= "table" then
+			selection = {}
+			state.selectedSkills[playableFolder.Name] = selection
+		end
+
+		local heading = Instance.new("TextLabel")
+		heading.Size = UDim2.new(1, -12, 0, 25)
+		heading.Position = UDim2.fromOffset(6, 0)
+		heading.BackgroundTransparency = 1
+		heading.TextColor3 = COLORS.text
+		heading.Text = playableFolder.Name
+		heading.TextSize = 16
+		heading.Font = Enum.Font.SourceSansBold
+		heading.TextXAlignment = Enum.TextXAlignment.Center
+		heading.ZIndex = 17
+		heading.Parent = options
+
+		for _, skill in ipairs(skills) do
+			local selected = selection[skill.Name] ~= false
+			local option = Instance.new("TextButton")
+			option.Size = UDim2.new(1, -8, 0, 30)
+			option.BackgroundColor3 = COLORS.background
+			option.Text = skill.Name
+			option.TextColor3 = COLORS.text
+			option.TextSize = 14
+			option.Font = Enum.Font.SourceSans
+			option.TextXAlignment = Enum.TextXAlignment.Left
+			option.BorderColor3 = COLORS.border
+			option.AutoButtonColor = false
+			option.ZIndex = 17
+			option.Parent = options
+			local optionPadding = Instance.new("UIPadding")
+			optionPadding.PaddingLeft = UDim.new(0, 10)
+			optionPadding.PaddingRight = UDim.new(0, 30)
+			optionPadding.Parent = option
+
+			local indicator = Instance.new("Frame")
+			indicator.Size = UDim2.fromOffset(16, 16)
+			indicator.Position = UDim2.new(1, -23, 0.5, -8)
+			indicator.BackgroundColor3 = selected and COLORS.controlOn or COLORS.muted
+			indicator.BorderSizePixel = 0
+			indicator.ZIndex = 18
+			indicator.Parent = option
+			local indicatorCorner = Instance.new("UICorner")
+			indicatorCorner.CornerRadius = UDim.new(1, 0)
+			indicatorCorner.Parent = indicator
+			table.insert(skillIndicators, { name = skill.Name, indicator = indicator })
+
+			option.MouseButton1Click:Connect(function()
+				selection[skill.Name] = selection[skill.Name] == false
+				saveConfig()
+				updateSkillIndicators(selection)
+			end)
+		end
+	end
+
+	button.MouseButton1Click:Connect(function()
+		options.Visible = not options.Visible
+		if options.Visible then
+			refreshOptions()
+			picker.Size = UDim2.new(1, -4, 0, 184)
+		else
+			picker.Size = UDim2.new(1, -4, 0, 34)
+		end
 	end)
 end
 
@@ -1090,7 +2193,7 @@ local homeInfo = Instance.new("TextLabel")
 homeInfo.Size = UDim2.new(1, -4, 0, 220)
 homeInfo.BackgroundColor3 = COLORS.background
 homeInfo.TextColor3 = COLORS.text
-homeInfo.Text = "FriX Rewrite\n\nA lightweight remake focused on improving the user experience and reducing lag\n\nUpdated V1.1\n- Added ESP feature\nRemove Something\n- Added Auto Farm (Main tab) and Settings tab\n- Removed unnecessary feature"
+homeInfo.Text = "FriX Rewrite\n\nA lightweight remake focused on improving the user experience and reducing lag\n\nUpdated V1.2\n- Separate Tech into three different ones\n- Fix Auto Farm Issue\n- Added Auto Skill For Auto Farm\n- Fix Lag/Memory Leak"
 homeInfo.TextSize = 15
 homeInfo.Font = Enum.Font.SourceSans
 homeInfo.TextWrapped = true
@@ -1101,8 +2204,14 @@ homeInfo.ZIndex = 13
 homeInfo.Parent = homePage
 
 content = mainPage
-createToggle("Auto farm", false, function(value)
+createToggle("Auto Farm", false, function(value)
 	if value then startAutoFarm() else stopAutoFarm() end
+end)
+createToggle("Auto Spawn partner", false, function(value)
+	if value then startAutoSpawnPartner() else stopAutoSpawnPartner() end
+end)
+createToggle("Auto purchase upgrade", false, function(value)
+	if value then startAutoPurchaseUpgrade() else stopAutoPurchaseUpgrade() end
 end)
 
 createToggle("Instant kill (Need 1 Hit)", false, function(value)
@@ -1116,21 +2225,36 @@ createToggle("ESP NPC", false, function(value)
 end)
 
 content = settingsPage
-createTextInput("Name playable", state.playableName, function(value)
-	state.playableName = value
-	saveConfig()
+createSection("Auto Farm Setting", function(section)
+	createTextInput("Name playable", state.playableName, function(value)
+		state.playableName = value
+		saveConfig()
+	end, section)
+	createSkillPicker(section)
+	createNumberInput("STRENGTH level", state.levelStrength, function(value)
+		state.levelStrength = math.max(1, math.floor(value))
+		saveConfig()
+	end, section)
+	createNumberInput("TECH level", state.levelTech, function(value)
+		state.levelTech = math.max(1, math.floor(value))
+		saveConfig()
+	end, section)
+	createNumberInput("MORALE level", state.levelMorale, function(value)
+		state.levelMorale = math.max(1, math.floor(value))
+		saveConfig()
+	end, section)
+	createModePicker(section)
+	createNumberInput("M1 (1/2/3)", state.attackIndex, function(value)
+		state.attackIndex = math.clamp(math.floor(value), 1, 3)
+		saveConfig()
+	end, section)
+	createNumberInput("Height", state.hoverHeight, function(value)
+		state.hoverHeight = math.max(0, value)
+		saveConfig()
+	end, section)
 end)
-createNumberInput("Technology", state.techLevel, function(value)
-	state.techLevel = math.max(1, math.floor(value))
-	saveConfig()
-end)
-createTextInput("Mode name", state.modeName, function(value)
-	state.modeName = value
-	saveConfig()
-end)
-createNumberInput("Attack (1/2/3)", state.attackIndex, function(value)
-	state.attackIndex = math.clamp(math.floor(value), 1, 3)
-	saveConfig()
+createSection("Auto Spawn partner Setting", function(section)
+	createPartnerPicker(section)
 end)
 
 content = playerPage
@@ -1170,6 +2294,10 @@ end
 title.InputBegan:Connect(function(input) beginDrag(menu, input) end)
 toggleButton.InputBegan:Connect(function(input) beginDrag(toggleButton, input) end)
 
+local lastNoclipScan = 0
+local noclipWasEnabled = false
+local noclipCharacter
+
 connect(UserInputService.InputChanged:Connect(function(input)
 	if not dragging then return end
 	if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
@@ -1193,10 +2321,29 @@ connect(RunService.Heartbeat:Connect(function()
 	if state.gravity then Workspace.Gravity = state.gravityValue end
 
 	local character = getCharacter()
-	if character and state.noclip then
-		for _, part in ipairs(character:GetDescendants()) do
-			if part:IsA("BasePart") then part.CanCollide = false end
+	if state.noclip and character then
+		if not noclipWasEnabled or character ~= noclipCharacter then
+			lastNoclipScan = 0
 		end
+		noclipCharacter = character
+		if os.clock() - lastNoclipScan >= 0.5 then
+			lastNoclipScan = os.clock()
+			for _, part in ipairs(character:GetDescendants()) do
+				if part:IsA("BasePart") and part.CanCollide then
+					part.CanCollide = false
+				end
+			end
+		end
+		noclipWasEnabled = true
+	elseif noclipWasEnabled then
+		local restoreCharacter = noclipCharacter or character
+		for _, part in ipairs(restoreCharacter and restoreCharacter:GetDescendants() or {}) do
+			if part:IsA("BasePart") and not part.CanCollide then
+				part.CanCollide = true
+			end
+		end
+		noclipCharacter = nil
+		noclipWasEnabled = false
 	end
 
 	if state.fly and character then
@@ -1229,23 +2376,16 @@ end)
 
 shared.FrixRewriteCleanup = function()
 	stopAutoFarm()
+	stopAutoSpawnPartner()
+	stopAutoPurchaseUpgrade()
 	stopPlayerFeatures()
 	stopNpcEsp()
 	stopInstantKill()
 	stopInstantKillNoHit()
-	for _, connection in ipairs(connections) do
-		disconnect(connection)
+	while #connections > 0 do
+		disconnect(connections[#connections])
 	end
-	connections = {}
 	if gui and gui.Parent then
 		gui:Destroy()
 	end
-end
-
-if not enforceStaffAccess() then
-	return
-end
-
-if not advanceIntegrity(2, 3) then
-	return
 end
